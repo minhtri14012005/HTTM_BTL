@@ -1,0 +1,5 @@
+{
+  "code-runner.runInTerminal": true,
+  "python.defaultInterpreterPath": "${workspaceFolder}/.venv/Scripts/python.exe",
+  "python.terminal.activateEnvironment": false
+}

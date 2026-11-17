@@ -1,0 +1,118 @@
+﻿/* Local UI regression. Never grants or opens a physical camera; never changes people. */
+const { chromium } = require('../.tools/qa/node_modules/playwright');
+const assert = require('node:assert/strict');
+const path = require('node:path');
+(async()=>{
+ const browser=await chromium.launch({channel:'chrome',headless:true});
+ const context=await browser.newContext({viewport:{width:1600,height:960}});
+ const page=await context.newPage();const errors=[];page.on('pageerror',e=>errors.push(e.message));
+ const toolRequests=[];
+ page.on('request',request=>{if(/\/api\/(diagnostics|video-evaluations)/.test(request.url())) toolRequests.push(request.url());});
+ await page.addInitScript(()=>{window.__cameraCalls=0; navigator.mediaDevices.getUserMedia=async()=>{window.__cameraCalls++;throw new Error('Physical cameras are disabled in automated QA');};});
+ try{
+  const reviewArgument=process.argv.find(argument=>argument.startsWith('--review-job='));
+  if(reviewArgument){
+   const id=reviewArgument.slice('--review-job='.length);
+   assert.match(id,/^[a-f0-9]{32}$/);
+   const response=await page.request.get(`http://127.0.0.1:8000/api/videos/${id}`);
+   const status=await response.json();
+   const at=Math.min(37.2,status.analyzed_until-.1);
+   assert.ok(at>=32);
+   let interceptedPause=0;
+   await page.route(`**/api/videos/${id}/control`,async route=>{
+    assert.equal(route.request().postDataJSON().action,'pause');
+    interceptedPause++;
+    await route.fulfill({status:200,contentType:'application/json',body:JSON.stringify({...status,state:'paused'})});
+   });
+   await page.goto(`http://127.0.0.1:8000/?video_job=${id}&at=${at}&review_faces=1`);
+   await page.locator('.truth-face img').first().waitFor();
+   assert.ok(Math.abs(await page.locator('.upload-stage video').evaluate(video=>video.currentTime)-at)<.04);
+   const choices=await page.locator('.truth-face select').evaluateAll(selects=>selects.map(select=>select.value));
+   assert.ok(choices.length>0 && choices.every(value=>value===''));
+   assert.equal(interceptedPause,1);
+   assert.equal(await page.evaluate(()=>window.__cameraCalls),0);
+   assert.deepEqual(errors,[]);
+   console.log(JSON.stringify({real_video_review:'passed',timestamp:at,face_crops:choices.length,preselected_identities:0,physical_camera_calls:0,server_mutations:0}));
+   return;
+  }
+  await page.goto('http://127.0.0.1:8000/');
+  await page.getByRole('heading',{name:'Camera trực tiếp',exact:true}).waitFor();
+  assert.equal(await page.locator('.toolbar select option').count(),2);
+  assert.equal(await page.locator('.diagnostic-entry,.diagnostic-summary,.diagnostic-coverage').count(),0);
+  assert.equal(toolRequests.length,0,'Normal UI must not fetch diagnostic history');
+  await page.screenshot({path:'.tools/qa/hybrid-live-clean.png',fullPage:true});
+  await page.getByRole('button',{name:'Chẩn đoán',exact:true}).click();
+  await page.getByRole('button',{name:'Kiểm thử AI bằng Camo Camera',exact:true}).waitFor();
+  await page.waitForFunction(()=>!Array.from(document.querySelectorAll('button')).find(b=>b.textContent==='Kiểm thử AI bằng Camo Camera').disabled);
+  const history=await (await page.request.get('http://127.0.0.1:8000/api/diagnostics')).json();
+  const analyzed=history.runs.find(r=>r.state==='complete'&&r.summary?.frames>0&&r.analysis);
+  if(analyzed){
+   await page.locator(`.diagnostic-summary[data-run-id="${analyzed.id}"]`).waitFor();
+   await page.getByText('Xem số đo từng model, nguyên nhân và bước xử lý',{exact:true}).click();
+   assert.equal(await page.locator('.diagnostic-summary .diagnostic-model-table:visible tbody tr').count(),Object.keys(analyzed.analysis.models).length);
+   await page.screenshot({path:'.tools/qa/auto-diagnostic-analysis.png',fullPage:true});
+   await page.getByText('Xem số đo từng model, nguyên nhân và bước xử lý',{exact:true}).click();
+  }
+  await page.screenshot({path:'.tools/qa/hybrid-live.png',fullPage:true});
+  await page.getByRole('button',{name:'Kiểm thử AI bằng Camo Camera',exact:true}).click();
+  await page.getByRole('heading',{name:'Bạn đã sẵn sàng?',exact:true}).waitFor();
+  assert.equal(await page.locator('.diagnostic-screen').count(),0);
+  assert.equal(await page.evaluate(()=>window.__cameraCalls),0);
+  assert.equal(await page.getByLabel('Tình huống kiểm thử').locator('option').count(),15);
+  await page.getByLabel('Tình huống kiểm thử').selectOption('Đeo khẩu trang 6 m');
+  await page.locator('.diagnostic-instruction-preview').getByText('ĐỨNG CÁCH CAMERA 6 M',{exact:true}).waitFor();
+  await page.locator('.diagnostic-instruction-preview').getByText('ĐEO KHẨU TRANG — NHÌN VỀ CAMERA',{exact:true}).waitFor();
+  await page.screenshot({path:'.tools/qa/hybrid-gate.png',fullPage:true});
+  await page.getByRole('button',{name:'Chưa sẵn sàng',exact:true}).click();
+  assert.equal(await page.locator('[aria-label="Xác nhận sẵn sàng kiểm thử"]').count(),0);
+  assert.equal(await page.evaluate(()=>window.__cameraCalls),0);
+  await page.getByRole('button',{name:'Danh sách người',exact:true}).click();
+  await page.getByRole('heading',{name:'Danh sách người cần tìm',exact:true}).waitFor();
+  await page.screenshot({path:'.tools/qa/hybrid-people.png',fullPage:true});
+  await page.getByRole('button',{name:'Đóng chẩn đoán',exact:true}).click();
+  assert.equal(await page.locator('.diagnostic-entry,.diagnostic-summary,.diagnostic-coverage').count(),0);
+  await page.getByRole('button',{name:'Phân tích video',exact:true}).click();
+  assert.equal(await page.locator('.video-ground-truth').count(),0);
+  await page.locator('input[type=file]').setInputFiles(path.resolve('.tools/qa/sample.mp4'));
+  await page.getByRole('button',{name:'Phát & phân tích',exact:true}).click({timeout:60000});
+  assert.equal(await page.locator('.video-ground-truth').count(),0);
+  await page.getByRole('button',{name:'Chẩn đoán',exact:true}).click();
+  await page.getByRole('heading',{name:'Đối chứng video · Nhãn do bạn xác nhận',exact:true}).waitFor();
+  assert.equal(await page.getByLabel('Nhãn xác nhận').locator('option').count(),3);
+  await page.waitForFunction(()=>document.querySelector('.upload-stage video')?.currentTime>.25,null,{timeout:120000});
+  const at=await page.locator('.upload-stage video').evaluate(v=>v.currentTime);
+  await page.getByRole('button',{name:'Tạm dừng',exact:true}).first().click();
+  await page.waitForFunction(()=>document.querySelector('.upload-stage video').paused);
+  await page.getByRole('slider',{name:'Vị trí phát video'}).fill('0.1');
+  await page.waitForFunction(()=>Math.abs(document.querySelector('.upload-stage video').currentTime-.1)<.06);
+  await page.screenshot({path:'.tools/qa/hybrid-video.png',fullPage:true});
+  const mediaUrl=await page.locator('.upload-stage video').getAttribute('src');
+  const activeJob=mediaUrl.match(/videos\/([a-f0-9]{32})\/media/)[1];
+  await page.goto(`http://127.0.0.1:8000/?video_job=${activeJob}&at=0.1&review_faces=1`);
+  await page.locator('.truth-face img').first().waitFor();
+  assert.equal(await page.locator('.truth-face select').first().inputValue(),'');
+  assert.equal(await page.locator('.truth-face input[type=checkbox]').count(),0);
+  const imageLoaded=await page.locator('.truth-face img').first().evaluate(img=>img.complete&&img.naturalWidth>0);
+  assert.equal(imageLoaded,true);
+  await page.screenshot({path:'.tools/qa/video-face-ground-truth.png',fullPage:true});
+  await page.getByRole('button',{name:'Phát & phân tích',exact:true}).click();
+  await page.waitForFunction(()=>document.querySelector('.upload-stage video')?.currentTime>.3,null,{timeout:120000});
+  await page.route(/\/api\/videos\/[a-f0-9]{32}$/, async route => {
+   if(route.request().method()==='GET') await route.fulfill({status:404,contentType:'application/json',body:JSON.stringify({detail:'Unit expired job'})});
+   else await route.continue();
+  });
+  await page.waitForFunction(()=>!document.querySelector('.upload-stage video')?.getAttribute('src'));
+  await page.reload();
+  await page.getByRole('button',{name:'Phân tích video',exact:true}).click();
+  assert.equal(await page.locator('.upload-stage video').getAttribute('src'),null);
+  assert.equal(await page.locator('.video-ground-truth').count(),0);
+  assert.equal(await page.locator('.tools-notice').count(),0);
+  assert.equal(await page.evaluate(()=>window.__cameraCalls),0);
+  await page.setViewportSize({width:390,height:844});
+  await page.getByRole('button',{name:'Camera trực tiếp',exact:true}).click();
+  await page.screenshot({path:'.tools/qa/hybrid-mobile.png',fullPage:true});
+  assert.equal(await page.evaluate(()=>document.documentElement.scrollWidth>innerWidth),false);
+  assert.deepEqual(errors,[]);
+  console.log(JSON.stringify({ui:'passed',camera_calls:0,video_played_seconds:at,pause_seek_resume:'passed',reload_video_empty:true,js_errors:errors}));
+ }finally{await browser.close();}
+})().catch(e=>{console.error(e);process.exit(1);});
